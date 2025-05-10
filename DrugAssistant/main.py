@@ -50,8 +50,7 @@ def get_chat_history_text(history):
 
 @st.cache_resource
 def load_prompt():
-    return hub.pull("hwchase17/openai-functions-agent")
-    # return hub.pull("hwchase17/structured-chat-agent")
+    return hub.pull("hwchase17/structured-chat-agent")
 
 
 def single_mol():
@@ -74,16 +73,20 @@ def single_mol():
 
     # 协调 Agent 的提示词
     coordinator_prompt = ChatPromptTemplate.from_template(
-        open("/home/hch/DrugAgent/prompt/coordinator_prompt.txt").read()
+        open("/prompt/coordinator_prompt.txt").read()
     )
     coordinator_agent = LLMChain(llm=client, prompt=coordinator_prompt)
 
     # 任务分解 Agent 的提示词
     decomposer_prompt = ChatPromptTemplate.from_template(
-        open("/home/hch/DrugAgent/prompt/decomposer_prompt.txt").read()
+        open("/prompt/decomposer_prompt.txt").read()
     )
     decomposer_agent = LLMChain(llm=client, prompt=decomposer_prompt)
 
+    # 综合 Agent 的提示词
+    synthesizer_prompt = ChatPromptTemplate.from_template(
+        open("/prompt/synthesizer_prompt.txt").read()
+    )
     # -------------------- AgentExecutor 缓存 --------------------
     if "agent_executor" not in st.session_state:
         structured_agent = create_tool_calling_agent(
@@ -130,7 +133,7 @@ def single_mol():
         st_callback = StreamlitCallbackHandler(st.container())
         config = {"configurable": {"session_id": "any"}, "callbacks": [st_callback]}
 
-        # ➤ Step 1: 协调 Agent 提取任务结构
+        # ➤ Step 1: 协调智能体提取任务结构
         chat_history_text = get_chat_history_text(st.session_state.display_history)
         coord_result = coordinator_agent.invoke(
             {"request": prompt, "chat_history": chat_history_text}
@@ -156,23 +159,45 @@ def single_mol():
         else:
             agent_input = prompt
 
-        # ➤ Step 3: 统一传给 Structured Agent 执行
+        # ➤ Step 3: 统一传给专家智能体执行
         response = agent_with_chat_history.invoke({"input": agent_input}, config)
         logger.info("Structured Agent Output: %s", response)
 
-        # ➤ Step 4: 精炼输出
-        template = (
-            """你是一个语言助手，请将以下结构化信息整理成自然、流畅的中文回答：\n{info}"""
-        )
-        refine_prompt = PromptTemplate.from_template(template)
+        # ➤ Step 4: 综合智能体分析
+        refine_prompt = PromptTemplate.from_template(synthesizer_prompt)
         refine_agent = LLMChain(llm=client, prompt=refine_prompt)
 
-        final_response = refine_agent.run({"info": response["output"]})
-        logger.info("Refine Agent Output: %s", final_response)
+        raw_summary = refine_agent.run({
+            "request": prompt,
+            "subtasks": json.dumps(decomposer_output, ensure_ascii=False),
+            "expert_results": json.dumps(response.get("output"), ensure_ascii=False),
+        })
 
-        # -------------------- 显示最终结果 --------------------
-        st.chat_message("assistant").write(final_response)
-        st.session_state.display_history.add_ai_message(final_response)
+        # 解析并分支处理
+        try:
+            result = json.loads(raw_summary)
+        except json.JSONDecodeError:
+            st.error("无法解析综合智能体的输出，请检查提示词或 LLM 响应。")
+            result = {"is_solved": False, "unsolved_subtask": "解析错误", "final_summary": raw_summary}
+
+        if not result.get("is_solved", False):
+            unsolved = result.get("unsolved_subtask", "未知子任务")
+            # 反馈给协调智能体
+            coord_feedback = coordinator_agent.invoke({
+                "request": unsolved,
+                "chat_history": get_chat_history_text(st.session_state.display_history)
+            })
+            logger.info("Coordinator Feedback Output: %s", coord_feedback)
+
+            st.chat_message("assistant").write(
+                f"检测到未完成子任务：“{unsolved}”，已反馈给协调智能体，继续处理。"
+            )
+            st.warning(f"当前进展：{result.get('final_summary')}")
+        else:
+            final_text = result.get("final_summary", "")
+            st.chat_message("assistant").write(final_text)
+            st.session_state.display_history.add_ai_message(final_text)
+
 
 
 if __name__ == "__main__":
